@@ -172,6 +172,56 @@ def get_theme_css() -> str:
     .cc-rail-seg.cc-rail-current { background: #5A5954; animation: cc-badge-pulse 1.6s ease-in-out infinite; }
 
     /* ===================================================================
+       Connecting animation - waiting-for-opponent screen. Blinking
+       terminal cursor + a scanning row of blocks that pulse amber in
+       sequence (staggered animation-delay per segment set inline).
+       =================================================================== */
+
+    .cc-connecting {
+        margin: 28px 0 8px;
+    }
+    .cc-connecting-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        margin-bottom: 12px;
+    }
+    .cc-connecting-label {
+        font-family: 'JetBrains Mono', monospace;
+        font-size: 13px;
+        color: #FAC775;
+        letter-spacing: 1.5px;
+        text-transform: uppercase;
+    }
+    .cc-connecting-cursor {
+        display: inline-block;
+        width: 8px;
+        height: 14px;
+        background: #FAC775;
+        animation: cc-cursor-blink 0.9s steps(1) infinite;
+    }
+    .cc-scan {
+        display: flex;
+        gap: 3px;
+        max-width: 340px;
+    }
+    .cc-scan-seg {
+        height: 5px;
+        flex: 1;
+        background: #2C2C2A;
+        animation: cc-scan-light 1.8s ease-in-out infinite;
+    }
+
+    @keyframes cc-cursor-blink {
+        0%, 49% { opacity: 1; }
+        50%, 100% { opacity: 0; }
+    }
+    @keyframes cc-scan-light {
+        0%, 100% { background: #2C2C2A; }
+        50% { background: #FAC775; }
+    }
+
+    /* ===================================================================
        Busy / waiting states - a quiet breathing glow instead of a
        generic spinner, used behind "waiting for opponent / generating /
        judging" info boxes so the app still feels alive while it waits.

@@ -86,6 +86,22 @@ TOPIC_POOL = {
 
 _QUESTION_FIELD_LOOKUP = {"coding": "statement", "debug": "buggy_code", "aptitude": "question", "logic": "question"}
 
+# Hardcoded city -> (lat, lon), no geocoding API needed (zero cost/quota
+# risk). Powers the "Battle Origins" map on the landing page - the one
+# rubric widget (st.map) nothing else in the app currently touches.
+CITY_COORDS = {
+    "Mumbai": (19.0760, 72.8777),
+    "Delhi": (28.7041, 77.1025),
+    "Bengaluru": (12.9716, 77.5946),
+    "Hyderabad": (17.3850, 78.4867),
+    "Chennai": (13.0827, 80.2707),
+    "Pune": (18.5204, 73.8567),
+    "Kolkata": (22.5726, 88.3639),
+    "Ahmedabad": (23.0225, 72.5714),
+    "Jaipur": (26.9124, 75.7873),
+    "Lucknow": (26.8467, 80.9462),
+}
+
 # Hybrid scoring weights for coding/debug: deterministic Judge0 pass ratio
 # blended with Gemini's qualitative code-quality score, so credit reflects
 # actual line-by-line approach quality, not just "did the output match".
@@ -183,6 +199,7 @@ def render_landing() -> None:
     with tab_create:
         with st.form("create_form"):
             name = st.text_input("Your name")
+            city = st.selectbox("Battling from (optional)", ["(prefer not to say)"] + list(CITY_COORDS.keys()))
             go = st.form_submit_button("CREATE MATCH", type="primary")
         if go:
             if not name.strip():
@@ -193,9 +210,13 @@ def render_landing() -> None:
                     if st.session_state.problem_type in ("coding", "debug")
                     else None
                 )
+                lat, lon = CITY_COORDS.get(city, (None, None))
                 profile = db.get_or_create_player(name.strip())
                 match_id = db.create_match(st.session_state.problem_type, language, rounds_total)
-                db.join_match(match_id, name.strip(), profile["rating"])
+                db.join_match(
+                    match_id, name.strip(), profile["rating"],
+                    city=city if city in CITY_COORDS else None, lat=lat, lon=lon,
+                )
                 _set_my_name(match_id, name.strip())
                 _set_active_match_id(match_id)
                 st.rerun()
@@ -204,6 +225,10 @@ def render_landing() -> None:
         with st.form("join_form"):
             name = st.text_input("Your name", key="join_name")
             code = st.text_input("Match code", key="join_code")
+            city = st.selectbox(
+                "Battling from (optional)", ["(prefer not to say)"] + list(CITY_COORDS.keys()),
+                key="join_city",
+            )
             go = st.form_submit_button("JOIN MATCH", type="primary")
         if go:
             if not name.strip() or not code.strip():
@@ -218,8 +243,12 @@ def render_landing() -> None:
                 elif len(state.get("players", {})) >= 2:
                     st.error("This match is already full.")
                 else:
+                    lat, lon = CITY_COORDS.get(city, (None, None))
                     profile = db.get_or_create_player(name.strip())
-                    db.join_match(match_id, name.strip(), profile["rating"])
+                    db.join_match(
+                        match_id, name.strip(), profile["rating"],
+                        city=city if city in CITY_COORDS else None, lat=lat, lon=lon,
+                    )
                     _set_my_name(match_id, name.strip())
                     _set_active_match_id(match_id)
                     st.rerun()
@@ -279,6 +308,30 @@ def render_landing() -> None:
 
     with tab_analytics:
         render_analytics_tab()
+
+    st.divider()
+    render_battle_origins_map()
+
+
+def render_battle_origins_map() -> None:
+    """The one rubric widget (st.map) nothing else touches. Shows where
+    currently-active players (any match not yet 'complete') are battling
+    from, using the city they optionally picked at create/join - no
+    geocoding API call, just a hardcoded lat/lon lookup (CITY_COORDS)."""
+    matches = db.get_all_matches()
+    active_matches = [m for m in matches if m.get("status") != "complete"]
+
+    points = []
+    for m in active_matches:
+        for _name, p in (m.get("players") or {}).items():
+            if isinstance(p, dict) and p.get("lat") is not None and p.get("lon") is not None:
+                points.append({"lat": p["lat"], "lon": p["lon"]})
+
+    st.markdown('<span class="cc-h3">Battle origins - live players</span>', unsafe_allow_html=True)
+    if points:
+        st.map(pd.DataFrame(points), size=60, color="#FAC775")
+    else:
+        st.caption("No active players have shared a city yet - it's optional at create/join.")
 
 
 # ---------------------------------------------------------------------------
@@ -432,13 +485,43 @@ def render_match(match_id: str) -> None:
                 st.rerun()
             return
 
-    st.markdown(f'<span class="cc-judge-label">MATCH CODE</span> `{match_id}`', unsafe_allow_html=True)
-
     names = list(players.keys())
+
+    # toast: opponent joined. One-shot per browser tab via session_state -
+    # fires the run this tab's own view of player-count first crosses 1->2,
+    # regardless of which of the two players is looking at the time.
+    join_toast_key = f"seen_player_count_{match_id}"
+    prev_count = st.session_state.get(join_toast_key, len(names))
+    if prev_count < 2 and len(names) == 2:
+        opponent = next((n for n in names if n != me), names[0])
+        st.toast(f"⚔️ {opponent} joined the match!")
+    st.session_state[join_toast_key] = len(names)
+
     if len(names) < 2:
-        st.markdown("### Waiting for opponent...")
+        # Scanning bar - each segment pulses amber in sequence via a
+        # staggered animation-delay, so the light appears to sweep left to
+        # right on loop. Purely CSS, no JS/rerun needed to animate.
+        n_segs = 14
+        scan_segs = "".join(
+            f'<div class="cc-scan-seg" style="animation-delay:{i * 0.09:.2f}s;"></div>'
+            for i in range(n_segs)
+        )
+        st.markdown(
+            f"""
+            <div class="cc-connecting">
+              <div class="cc-connecting-row">
+                <span class="cc-connecting-label">Connecting</span>
+                <span class="cc-connecting-cursor"></span>
+              </div>
+              <div class="cc-scan">{scan_segs}</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.caption("Send this code to your friend so they can join:")
+        st.code(match_id, language=None)
         st.write(f"**{names[0]}** (rating {players[names[0]]['rating']}) is in the arena.")
-        st.caption("Share the match code above - the fight card appears the moment someone joins.")
+        st.caption("The fight card appears the moment someone joins.")
         if st.button("LEAVE"):
             _clear_active_match_id()
             st.rerun()
@@ -447,25 +530,47 @@ def render_match(match_id: str) -> None:
     a_name, b_name = names[0], names[1]
     a, b = players[a_name], players[b_name]
     round_wins = state.get("round_wins", {})
-
-    st.markdown(
-        f"""
-        <div class="cc-card">
-          <div class="cc-panel-a">
-            <div class="cc-name">{a_name}</div>
-            <div class="cc-rating" style="color:#9FE1CB;">RATING {a['rating']} · ROUNDS {round_wins.get(a_name, 0)}</div>
-          </div>
-          <div class="cc-panel-b">
-            <div class="cc-name">{b_name}</div>
-            <div class="cc-rating" style="color:#F09595;">RATING {b['rating']} · ROUNDS {round_wins.get(b_name, 0)}</div>
-          </div>
-          <div class="cc-vs">VS</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
     status = state.get("status")
+
+    # --- Sidebar: persistent match status (code, fight card, round
+    # progress) so it's always visible without scrolling, while the main
+    # column stays focused on the actual puzzle/code/verdict content.
+    with st.sidebar:
+        st.markdown(f'<span class="cc-judge-label">MATCH CODE</span> `{match_id}`', unsafe_allow_html=True)
+        st.markdown(
+            f"""
+            <div class="cc-card">
+              <div class="cc-panel-a">
+                <div class="cc-name">{a_name}</div>
+                <div class="cc-rating" style="color:#9FE1CB;">RATING {a['rating']} · ROUNDS {round_wins.get(a_name, 0)}</div>
+              </div>
+              <div class="cc-panel-b">
+                <div class="cc-name">{b_name}</div>
+                <div class="cc-rating" style="color:#F09595;">RATING {b['rating']} · ROUNDS {round_wins.get(b_name, 0)}</div>
+              </div>
+              <div class="cc-vs">VS</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        if status in ("waiting", "active", "waiting_next_round"):
+            rounds_total_side = state.get("rounds_total", 1)
+            rail_segs = "".join(
+                f'<div class="cc-rail-seg {"cc-rail-done" if i < round_number - 1 else "cc-rail-current" if i == round_number - 1 else ""}"></div>'
+                for i in range(rounds_total_side)
+            )
+            st.markdown(
+                f'<div class="cc-rail-wrap"><span class="cc-rail-label">ROUND {round_number}/{rounds_total_side}</span>'
+                f'<div class="cc-rail">{rail_segs}</div></div>',
+                unsafe_allow_html=True,
+            )
+
+        st.divider()
+        if st.button("LEAVE MATCH", use_container_width=True):
+            _clear_active_match_id()
+            st.rerun()
+
     if status in ("waiting", "active", "waiting_next_round"):
         # "waiting" at this point always means "2 players present, puzzle
         # not generated yet" - the len(names) < 2 branch above already
@@ -480,10 +585,6 @@ def render_match(match_id: str) -> None:
         render_match_complete(state, players)
     else:
         st.write(f"Unhandled status: {status}")
-
-    if st.button("LEAVE MATCH"):
-        _clear_active_match_id()
-        st.rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -572,16 +673,7 @@ def render_puzzle_section(match_id: str, state: dict, me: str, round_number: int
             return
 
     st.divider()
-    rounds_total_for_rail = state.get("rounds_total", 1)
-    rail_segs = "".join(
-        f'<div class="cc-rail-seg {"cc-rail-done" if i < round_number - 1 else "cc-rail-current" if i == round_number - 1 else ""}"></div>'
-        for i in range(rounds_total_for_rail)
-    )
-    st.markdown(
-        f'<div class="cc-rail-wrap"><span class="cc-rail-label">ROUND {round_number}/{rounds_total_for_rail}</span>'
-        f'<div class="cc-rail">{rail_segs}</div></div>',
-        unsafe_allow_html=True,
-    )
+    st.caption(f"Round {round_number} of {state.get('rounds_total', 1)}")
 
     sample_tests = (puzzle.get("test_cases") or [])[:2] if problem_type in ("coding", "debug") else []
     options = []
@@ -822,6 +914,13 @@ def _render_submission_form(
 
 def render_round_resolution(match_id, state, round_state, round_number, players, me) -> None:
     if round_state.get("verdict") is not None:
+        # toast: fires once per (match, round) per browser tab - the
+        # first run in which this tab sees a verdict that's newly present.
+        verdict_toast_key = f"toasted_verdict_{match_id}_{round_number}"
+        if not st.session_state.get(verdict_toast_key):
+            st.toast("📋 Round result is in!")
+            st.session_state[verdict_toast_key] = True
+
         # Verdict already exists in the DB - just show it and wait for a
         # CONTINUE click. Advancing to the next round / match_over now
         # happens ONLY from this explicit click (db.advance_round), not
