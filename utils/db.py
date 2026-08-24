@@ -132,6 +132,7 @@ def create_match(problem_type: str, language: str | None, rounds_total: int = 1)
             "puzzle_generation_claimed_at": None,
             "rounds": {_round_key(1): _empty_round()},
             "final_ratings": None,
+            "created_at": _now_ms(),  # for analytics: sorting "recent matches"
         }
     )
     return match_id
@@ -403,3 +404,43 @@ def complete_match(match_id: str, final_ratings: dict) -> None:
     db.reference(f"matches/{match_id}").update(
         {"final_ratings": final_ratings, "status": "complete"}
     )
+
+
+# ---------------------------------------------------------------------------
+# Analytics - rating history log + aggregate match data.
+#
+# /players/{name} only ever stores the CURRENT rating (overwritten every
+# match by update_player_after_match) - there was never a record of what
+# the rating WAS at any earlier point, so a "rating over time" chart had
+# nothing to plot. record_rating_history() appends an immutable snapshot
+# each time a match completes, under /players/{name}/history (a Firebase
+# push-list, so entries get unique auto-generated keys and stay ordered
+# by insertion via their timestamp).
+# ---------------------------------------------------------------------------
+
+def record_rating_history(player_name: str, rating: int, result: str, match_id: str) -> None:
+    init_db()
+    db.reference(f"players/{player_name}/history").push({
+        "rating": rating, "result": result, "match_id": match_id, "ts": _now_ms(),
+    })
+
+
+def get_player_history(player_name: str) -> list[dict]:
+    """Chronological list of {rating, result, match_id, ts} for one
+    player, oldest first - ready to drop straight into a line chart."""
+    init_db()
+    raw = db.reference(f"players/{player_name}/history").get() or {}
+    entries = list(raw.values())
+    entries.sort(key=lambda e: e.get("ts", 0))
+    return entries
+
+
+def get_all_matches() -> list[dict]:
+    """Every match ever created, each tagged with its match_id - used for
+    aggregate analytics (mode popularity, average rounds, completion
+    rate, recent-matches list). Fine at demo/classroom scale; a real
+    production version would want a secondary index or pagination
+    instead of pulling the whole /matches tree."""
+    init_db()
+    raw = db.reference("matches").get() or {}
+    return [{**(m or {}), "match_id": match_id} for match_id, m in raw.items()]

@@ -176,7 +176,9 @@ def render_landing() -> None:
     )
 
     st.divider()
-    tab_create, tab_join, tab_leaderboard = st.tabs(["CREATE MATCH", "JOIN MATCH", "LEADERBOARD"])
+    tab_create, tab_join, tab_leaderboard, tab_analytics = st.tabs(
+        ["CREATE MATCH", "JOIN MATCH", "LEADERBOARD", "ANALYTICS"]
+    )
 
     with tab_create:
         with st.form("create_form"):
@@ -274,6 +276,104 @@ def render_landing() -> None:
                     "Matches": st.column_config.NumberColumn("MATCHES", width="small"),
                 },
             )
+
+    with tab_analytics:
+        render_analytics_tab()
+
+
+# ---------------------------------------------------------------------------
+# Analytics dashboard - KPIs, mode popularity, per-player rating trend, and
+# a recent-matches log. All derived via Pandas from db.get_all_matches() /
+# db.get_player_history() - a second, genuinely different view of the same
+# underlying data the leaderboard uses, not a re-skin of it.
+# ---------------------------------------------------------------------------
+
+def render_analytics_tab() -> None:
+    matches = db.get_all_matches()
+    if not matches:
+        st.caption("No matches yet - analytics fill in once people start playing.")
+        return
+
+    df = pd.DataFrame(matches)
+    df["problem_type"] = df.get("problem_type", pd.Series(dtype=str)).fillna("unknown")
+    df["rounds_total"] = df.get("rounds_total", pd.Series(dtype=float)).fillna(1)
+    df["status"] = df.get("status", pd.Series(dtype=str)).fillna("unknown")
+    df["created_at"] = df.get("created_at", pd.Series(dtype=float)).fillna(0)
+
+    completed = df[df["status"] == "complete"]
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("TOTAL MATCHES", len(df))
+    k2.metric(
+        "COMPLETED",
+        len(completed),
+        delta=f"{len(completed)}/{len(df)} finished" if len(df) else None,
+    )
+    top_mode = df["problem_type"].value_counts().idxmax() if not df.empty else "N/A"
+    k3.metric("TOP MODE", TYPES.get(top_mode, top_mode).upper())
+    k4.metric("AVG ROUNDS/MATCH", round(df["rounds_total"].mean(), 1))
+
+    st.divider()
+
+    col_left, col_right = st.columns(2)
+
+    with col_left:
+        st.markdown('<span class="cc-h3">Mode popularity</span>', unsafe_allow_html=True)
+        mode_counts = (
+            df["problem_type"].value_counts()
+            .rename(index=lambda k: TYPES.get(k, k))
+        )
+        st.bar_chart(mode_counts)
+
+    with col_right:
+        st.markdown('<span class="cc-h3">Rating over time</span>', unsafe_allow_html=True)
+        leaderboard_players = elo.get_leaderboard(db)
+        names = sorted(p["name"] for p in leaderboard_players)
+        if not names:
+            st.caption("No players yet.")
+        else:
+            selected = st.selectbox("Player", names, key="analytics_player_select")
+            history = db.get_player_history(selected)
+            if not history:
+                st.caption(f"{selected} hasn't finished a match yet.")
+            else:
+                hdf = pd.DataFrame(history).sort_values("ts").reset_index(drop=True)
+                hdf.index = hdf.index + 1  # 1-indexed "match number" on the x-axis
+                hdf.index.name = "Match #"
+                st.line_chart(hdf["rating"])
+
+    st.divider()
+    st.markdown('<span class="cc-h3">Recent matches</span>', unsafe_allow_html=True)
+
+    recent = df.sort_values("created_at", ascending=False).head(15).copy()
+
+    def _players_label(players_dict) -> str:
+        if not isinstance(players_dict, dict) or not players_dict:
+            return "-"
+        return " vs ".join(players_dict.keys())
+
+    recent_view = pd.DataFrame({
+        "Match": recent["match_id"],
+        "Mode": recent["problem_type"].map(lambda k: TYPES.get(k, k)),
+        "Rounds": recent["rounds_total"].astype(int),
+        "Status": recent["status"],
+        "Players": recent.get("players", pd.Series([{}] * len(recent))).map(_players_label),
+    })
+
+    st.data_editor(
+        recent_view,
+        use_container_width=True,
+        hide_index=True,
+        disabled=True,
+        key="recent_matches_editor",
+        column_config={
+            "Match": st.column_config.TextColumn("MATCH", width="small"),
+            "Mode": st.column_config.TextColumn("MODE", width="small"),
+            "Rounds": st.column_config.NumberColumn("ROUNDS", width="small"),
+            "Status": st.column_config.TextColumn("STATUS", width="small"),
+            "Players": st.column_config.TextColumn("PLAYERS", width="medium"),
+        },
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -542,11 +642,104 @@ def _render_submission_form(
         return
 
     if problem_type == "logic":
-        answer = st.text_area("Your answer / reasoning", height=200, key=f"logic_{match_id}_{round_number}")
-        if st.button("SUBMIT"):
-            db.submit_solution(match_id, round_number, me, {"answer": answer})
-            db.record_test_results(match_id, round_number, me, [])  # no deterministic check for logic
-            st.rerun()
+        # Multimodal: player can either type their reasoning, or speak it
+        # via the mic and have Gemini transcribe it. Whichever path is
+        # used, submission always ends up as plain text in the same
+        # {"answer": ...} shape - judge_submissions() doesn't need to know
+        # or care whether it came from typing or a mic recording.
+        mode_key = f"logic_mode_{match_id}_{round_number}"
+        transcript_key = f"logic_transcript_{match_id}_{round_number}"
+        fallback_msg_key = f"logic_voice_fallback_msg_{match_id}_{round_number}"
+        force_mode_key = f"logic_force_mode_{match_id}_{round_number}"
+
+        # Streamlit won't let a widget's own session_state key be
+        # reassigned AFTER that widget has rendered in the same script
+        # run - so a forced mode-switch (see the transcription-failure
+        # handler below) can only take effect on the NEXT run, applied
+        # here, BEFORE st.radio(key=mode_key) is created below.
+        if st.session_state.pop(force_mode_key, False):
+            st.session_state[mode_key] = "Type it"
+
+        input_mode = st.radio(
+            "How do you want to answer?", ["Type it", "Record it (mic)"],
+            horizontal=True, key=mode_key,
+        )
+
+        if input_mode == "Type it":
+            # If we just got bounced here automatically because voice
+            # transcription failed, say so once - otherwise it looks like
+            # the radio silently reset itself for no reason.
+            if fallback_msg_key in st.session_state:
+                st.warning(st.session_state.pop(fallback_msg_key))
+            answer = st.text_area("Your answer / reasoning", height=200, key=f"logic_{match_id}_{round_number}")
+            if st.button("SUBMIT", type="primary"):
+                if not answer.strip():
+                    st.error("Write an answer before submitting.")
+                else:
+                    db.submit_solution(match_id, round_number, me, {"answer": answer, "input_mode": "text"})
+                    db.record_test_results(match_id, round_number, me, [])  # no deterministic check for logic
+                    st.rerun()
+            return
+
+        # --- Record it (mic) ---
+        audio = st.audio_input("Record your reasoning out loud", key=f"logic_audio_{match_id}_{round_number}")
+
+        if transcript_key not in st.session_state:
+            if audio is None:
+                st.caption("Record your answer above, then transcribe it.")
+            elif st.button("TRANSCRIBE", type="primary"):
+                with st.spinner("Transcribing with Gemini..."):
+                    try:
+                        st.session_state[transcript_key] = gemini.transcribe_audio(
+                            audio.getvalue(), audio.type or "audio/wav"
+                        )
+                    except Exception as e:
+                        # Don't dead-end on a red error - degrade to typing
+                        # instead, since the player's actual goal (submit a
+                        # reasoned answer) is still achievable either way.
+                        # Quota exhaustion is common enough (shared daily
+                        # limit with puzzle-gen/judging) that it gets its
+                        # own clearer message rather than a raw traceback.
+                        err_text = str(e)
+                        if "RESOURCE_EXHAUSTED" in err_text or "429" in err_text:
+                            st.session_state[fallback_msg_key] = (
+                                "Voice transcription hit Gemini's daily free-tier limit "
+                                "right now, so we switched you to typing instead - your "
+                                "answer counts exactly the same either way."
+                            )
+                        else:
+                            st.session_state[fallback_msg_key] = (
+                                "Voice transcription didn't go through, so we switched you "
+                                "to typing instead - your answer counts exactly the same "
+                                "either way."
+                            )
+                        st.session_state[force_mode_key] = True
+                        st.rerun()
+                return
+            return
+
+        # Transcript exists - let the player review/edit it before it
+        # actually counts as their submission (speech-to-text isn't
+        # perfect, and this also avoids submitting on a misheard word).
+        st.success("Transcribed - review and edit if needed, then submit.")
+        edited = st.text_area(
+            "Transcript (editable)", value=st.session_state[transcript_key],
+            height=180, key=f"logic_transcript_edit_{match_id}_{round_number}",
+        )
+        col_retry, col_submit = st.columns(2)
+        with col_retry:
+            if st.button("RE-RECORD", use_container_width=True):
+                st.session_state.pop(transcript_key, None)
+                st.rerun()
+        with col_submit:
+            if st.button("SUBMIT", type="primary", use_container_width=True):
+                if not edited.strip():
+                    st.error("Transcript is empty - re-record or switch to 'Type it'.")
+                else:
+                    db.submit_solution(match_id, round_number, me, {"answer": edited, "input_mode": "voice"})
+                    db.record_test_results(match_id, round_number, me, [])
+                    st.session_state.pop(transcript_key, None)
+                    st.rerun()
         return
 
     # coding / debug - Run (sample tests only) then Submit (all tests).
@@ -813,6 +1006,8 @@ def render_match_finalize(match_id: str, state: dict, players: dict) -> None:
 
         db.update_player_after_match(a_name, new_a, result_a)
         db.update_player_after_match(b_name, new_b, result_b)
+        db.record_rating_history(a_name, new_a, result_a, match_id)
+        db.record_rating_history(b_name, new_b, result_b, match_id)
         db.complete_match(match_id, {a_name: new_a, b_name: new_b})
     finally:
         st.session_state[rating_flag] = False

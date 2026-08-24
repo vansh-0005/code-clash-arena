@@ -1,5 +1,5 @@
 """
-Phase 3: Gemini calls - puzzle generation + judging.
+Phase 3: Gemini calls - puzzle generation + judging + audio transcription.
 
 Uses the current google-genai SDK (the old google.generativeai package is
 deprecated and flagged unstable - see migration note below).
@@ -13,6 +13,7 @@ correct without checking.
 
 Free-tier budget notes:
 - ~2 Gemini calls per round (1 puzzle gen + 1 judge) -> ~6 calls per 3-round match
+- transcribe_audio() adds one more call per voice submission (Logic mode only)
 - Cache the puzzle in the DB row so it's generated once per match, not once per player
 - Wrap calls with backoff so a 429 shows a spinner, not a crash
 """
@@ -23,6 +24,7 @@ import random
 import difflib
 import concurrent.futures
 from google import genai
+from google.genai import types
 
 from prompts.templates import PUZZLE_PROMPTS, JUDGE_PROMPT
 
@@ -169,6 +171,40 @@ def judge_submissions(
     )
     raw = _call_with_backoff(prompt)
     return _parse_json(raw)
+
+
+# ---------------------------------------------------------------------------
+# Multimodal: mic-recorder transcription for Logic-round voice answers.
+# Player records their spoken reasoning via st.audio_input in app.py; this
+# sends the raw audio bytes straight to Gemini (audio understanding, not a
+# separate speech-to-text API) and gets back a clean transcript, which then
+# flows through the exact same text-based judging pipeline as a typed
+# answer - no changes needed anywhere else in the scoring logic.
+# ---------------------------------------------------------------------------
+
+def transcribe_audio(audio_bytes: bytes, mime_type: str = "audio/wav") -> str:
+    """Takes the raw bytes from st.audio_input (WebM/WAV depending on
+    browser) and returns a clean transcript string via Gemini's native
+    audio understanding. Raises on failure - callers should catch and
+    show an error / let the player fall back to typing instead."""
+    client = _get_client()
+    prompt = (
+        "Transcribe this spoken answer verbatim as plain text. Keep the "
+        "reasoning content exactly as spoken - only clean up obvious "
+        "filler words (um, uh) if they clearly interrupt sentence flow. "
+        "Return ONLY the transcript text, nothing else - no preamble, "
+        "no markdown, no quotation marks around it."
+    )
+    future = _executor.submit(
+        client.models.generate_content,
+        model=MODEL_NAME,
+        contents=[
+            types.Part.from_bytes(data=audio_bytes, mime_type=mime_type),
+            prompt,
+        ],
+    )
+    resp = future.result(timeout=CALL_TIMEOUT_SECONDS)
+    return (resp.text or "").strip()
 
 
 # Phase 3 fallback: pre-generate ~15-20 puzzles offline (run this file's
