@@ -19,7 +19,10 @@ def update_elo(rating_a: int, rating_b: int, score_a: float) -> tuple[int, int]:
 
 
 def get_leaderboard(db_module) -> list[dict]:
-    """TODO Phase 5: pull all players from Firebase 'leaderboard' node,
-    sort by rating desc, return list of {name, rating, wins, losses}
-    for rendering with st.data_editor in app.py."""
-    raise NotImplementedError
+    """Pulls all players from Firebase (utils/db.py's /players node),
+    sorted by rating desc. db_module is the utils.db module itself, passed
+    in so this file doesn't need its own Firebase import - matches the
+    pattern of the rest of the app treating db.py as the only Firebase
+    touchpoint."""
+    players = db_module.list_players()
+    return sorted(players, key=lambda p: p.get("rating", 1000), reverse=True)
