@@ -3,5 +3,3 @@ __pycache__/
 *.pyc
 .env
 venv/
-test_gemini.py
-list_models.py
