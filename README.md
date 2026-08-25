@@ -8,6 +8,9 @@
 
   a live 1v1 coding duel platform  //  built for MirAI School of Technology
 ```
+$ `cat contact.txt`
+
+LinkedIn: https://www.linkedin.com/in/vansh-sharma-27117b350/
 
 $ `cat about.txt`
 
