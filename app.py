@@ -7,7 +7,7 @@ PHASE STATUS:
 [x] Phase 3 - Gemini puzzle gen + judging (race-guarded)
 [x] Phase 4 - Judge0 grading, incl. pre-submit sample-test running
 [x] Phase 5 - Elo + leaderboard
-[ ] Phase 6 - deploy + docs
+[x] Phase 6 - deploy + docs
 
 Match structure: best-of-N rounds (N chosen at creation). Each round =
 fresh puzzle -> both submit -> hybrid grade (deterministic pass ratio +
